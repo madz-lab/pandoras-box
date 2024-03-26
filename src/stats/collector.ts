@@ -4,7 +4,6 @@ import axios, { AxiosResponse } from 'axios';
 import { SingleBar } from 'cli-progress';
 import Table from 'cli-table3';
 import Logger from '../logger/logger';
-import Batcher from '../runtime/batcher';
 
 class txStats {
     txHash: string;
@@ -49,35 +48,27 @@ class BlockInfo {
 
 class CollectorData {
     tps: number;
+    minTps: number;
+    maxTps: number;
     blockInfo: Map<number, BlockInfo>;
 
-    constructor(tps: number, blockInfo: Map<number, BlockInfo>) {
+    constructor(tps: number, minTps: number, maxTps: number, blockInfo: Map<number, BlockInfo>) {
         this.tps = tps;
+        this.minTps = minTps;
+        this.maxTps = maxTps;
         this.blockInfo = blockInfo;
-    }
-}
-
-class txBatchResult {
-    succeeded: txStats[];
-    remaining: string[];
-
-    errors: string[];
-
-    constructor(succeeded: txStats[], remaining: string[], errors: string[]) {
-        this.succeeded = succeeded;
-        this.remaining = remaining;
-
-        this.errors = errors;
     }
 }
 
 class StatCollector {
     async gatherTransactionReceipts(
         txHashes: string[],
-        batchSize: number,
+        stats: txStats[],
         provider: Provider
-    ): Promise<txStats[]> {
-        Logger.info('Gathering transaction receipts...');
+    ): Promise<Map<number, BlockInfo>> {
+        await this.waitForTxPoolToEmpty((provider as JsonRpcProvider).connection.url, txHashes.length);
+
+        Logger.info('\nGathering transaction receipts...');
 
         const receiptBar = new SingleBar({
             barCompleteChar: '\u2588',
@@ -91,85 +82,87 @@ class StatCollector {
 
         const fetchErrors: string[] = [];
 
-        let receiptBarProgress = 0;
-        let retryCounter = Math.ceil(txHashes.length * 0.025);
-        let remainingTransactions: string[] = txHashes;
-        let succeededTransactions: txStats[] = [];
+        const blocksMap: Map<number, BlockInfo> = new Map<number, BlockInfo>();
+        const txToBlockMap: Map<string, number> = new Map<string, number>();
 
-        const providerURL = (provider as JsonRpcProvider).connection.url;
-
-        // Fetch transaction receipts in batches,
-        // until the batch retry counter is reached (to avoid spamming)
-        while (remainingTransactions.length > 0) {
-            // Get the receipts for this batch
-            const result = await this.fetchTransactionReceipts(
-                remainingTransactions,
-                batchSize,
-                providerURL
-            );
-
-            // Save any fetch errors
-            for (const fetchErr of result.errors) {
-                fetchErrors.push(fetchErr);
-            }
-
-            // Update the remaining transactions whose
-            // receipts need to be fetched
-            remainingTransactions = result.remaining;
-
-            // Save the succeeded transactions
-            succeededTransactions = succeededTransactions.concat(
-                result.succeeded
-            );
-
-            // Update the user loading bar
-            receiptBar.increment(
-                succeededTransactions.length - receiptBarProgress
-            );
-            receiptBarProgress = succeededTransactions.length;
-
-            // Decrease the retry counter
-            retryCounter--;
-
-            if (remainingTransactions.length == 0 || retryCounter == 0) {
-                // If there are no more remaining transaction receipts to wait on,
-                // or the batch retries have been depleted, stop the batching process
-                break;
-            }
-
-            // Wait for a block to be mined on the network before asking
-            // for the receipts again
-            await new Promise((resolve) => {
-                provider.once('block', () => {
-                    resolve(null);
-                });
-            });
+        let stopFlag = false;
+        let timeout = txHashes.length * 500; // assume a transaction needs half a second
+        
+        if (timeout < 1000) {
+            timeout = 5000 // Set a minimum timeout of 5 seconds
+        } else if (timeout > 500000) { // if the timeout is too large, set it to 500 seconds
+            timeout = 500000;
         }
 
-        // Wait for the transaction receipts individually
-        // if they were not retrieved in the batching process.
-        // This process is slower, but it guarantees transaction receipts
-        // will eventually get retrieved, regardless of the number of blocks
-        for (const txHash of remainingTransactions) {
-            const txReceipt = await provider.waitForTransaction(
-                txHash,
-                1,
-                30 * 1000 // 30s per transaction
-            );
+        const receiptGatheringPromise = async () => {
+            for (const txHash of txHashes) {
+                try {
+                    if (stopFlag) {
+                        break;
+                    }
 
-            receiptBar.increment(1);
-
-            if (txReceipt.status != undefined && txReceipt.status == 0) {
-                throw new Error(
-                    `transaction ${txReceipt.transactionHash} failed on execution`
-                );
+                    if (txToBlockMap.has(txHash)) {
+                        stats.push(new txStats(txHash, txToBlockMap.get(txHash) as number));
+                        receiptBar.increment();
+    
+                        continue;
+                    }
+    
+                    const txReceipt = await provider.waitForTransaction(
+                        txHash,
+                        1,
+                        1000, // 1s
+                    );
+    
+                    if (txReceipt == null) {
+                        throw new Error(
+                            `transaction ${txHash} failed to be fetched in time`
+                        );
+                    } else if (txReceipt.status != undefined && txReceipt.status == 0) {
+                        throw new Error(
+                            `transaction ${txHash} failed during execution`
+                        );
+                    }
+    
+                    stats.push(new txStats(txHash, txReceipt.blockNumber));
+    
+                    const block = await provider.getBlock(txReceipt.blockNumber);
+                    blocksMap.set(
+                        block.number,
+                        new BlockInfo(
+                            block.number,
+                            block.timestamp,
+                            block.transactions.length,
+                            block.gasUsed,
+                            block.gasLimit
+                        )
+                    );
+    
+                    for (const tx of block.transactions) {
+                        txToBlockMap.set(tx, block.number);
+                    }
+    
+                } catch (e: any) {
+                    fetchErrors.push(e);
+                }
+    
+                receiptBar.increment();
             }
+        };
 
-            succeededTransactions.push(
-                new txStats(txHash, txReceipt.blockNumber)
-            );
+        const timeoutPromise = new Promise<boolean>((_, reject) => {
+            setTimeout(() => {
+                stopFlag = true; // Stop the txpoolStatusPromise loop
+                reject(new Error('Timeout: Waiting for tx pool to empty took longer than ' + timeout / 1000 + 'seconds.'));
+            }, timeout);
+        });
+
+        try {
+            await Promise.race([receiptGatheringPromise(), timeoutPromise]);
+        } catch (error: any) {
+            Logger.warn(error.message);
         }
-
+        
         receiptBar.stop();
         if (fetchErrors.length > 0) {
             Logger.warn('Errors encountered during batch sending:');
@@ -179,158 +172,17 @@ class StatCollector {
             }
         }
 
-        Logger.success('Gathered transaction receipts');
-
-        return succeededTransactions;
-    }
-
-    async fetchTransactionReceipts(
-        txHashes: string[],
-        batchSize: number,
-        url: string
-    ): Promise<txBatchResult> {
-        // Create the batches for transaction receipts
-        const batches: string[][] = Batcher.generateBatches<string>(
-            txHashes,
-            batchSize
-        );
-        const succeeded: txStats[] = [];
-        const remaining: string[] = [];
-        const batchErrors: string[] = [];
-
-        let nextIndx = 0;
-        const responses = await Promise.all<AxiosResponse<any, any>>(
-            batches.map((hashes) => {
-                let singleRequests = '';
-                for (let i = 0; i < hashes.length; i++) {
-                    singleRequests += JSON.stringify({
-                        jsonrpc: '2.0',
-                        method: 'eth_getTransactionReceipt',
-                        params: [hashes[i]],
-                        id: nextIndx++,
-                    });
-
-                    if (i != hashes.length - 1) {
-                        singleRequests += ',\n';
-                    }
-                }
-
-                return axios({
-                    url: url,
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    data: '[' + singleRequests + ']',
-                });
-            })
-        );
-
-        for (let batchIndex = 0; batchIndex < responses.length; batchIndex++) {
-            const data = responses[batchIndex].data;
-
-            for (
-                let txHashIndex = 0;
-                txHashIndex < data.length;
-                txHashIndex++
-            ) {
-                const batchItem = data[txHashIndex];
-
-                if (!batchItem.result) {
-                    remaining.push(batches[batchIndex][txHashIndex]);
-
-                    continue;
-                }
-
-                if (batchItem.hasOwnProperty('error')) {
-                    // Error occurred during batch sends
-                    batchErrors.push(batchItem.error.message);
-
-                    continue;
-                }
-
-                if (batchItem.result.status == '0x0') {
-                    // Transaction failed
-                    throw new Error(
-                        `transaction ${batchItem.result.transactionHash} failed on execution`
-                    );
-                }
-
-                succeeded.push(
-                    new txStats(
-                        batchItem.result.transactionHash,
-                        batchItem.result.blockNumber
-                    )
-                );
-            }
-        }
-
-        return new txBatchResult(succeeded, remaining, batchErrors);
-    }
-
-    async fetchBlockInfo(
-        stats: txStats[],
-        provider: Provider
-    ): Promise<Map<number, BlockInfo>> {
-        const blockSet: Set<number> = new Set<number>();
-        for (const s of stats) {
-            blockSet.add(s.block);
-        }
-
-        const blockFetchErrors: Error[] = [];
-
-        Logger.info('\nGathering block info...');
-        const blocksBar = new SingleBar({
-            barCompleteChar: '\u2588',
-            barIncompleteChar: '\u2591',
-            hideCursor: true,
-        });
-
-        blocksBar.start(blockSet.size, 0, {
-            speed: 'N/A',
-        });
-
-        const blocksMap: Map<number, BlockInfo> = new Map<number, BlockInfo>();
-        for (const block of blockSet.keys()) {
-            try {
-                const fetchedInfo = await provider.getBlock(block);
-
-                blocksBar.increment();
-
-                blocksMap.set(
-                    block,
-                    new BlockInfo(
-                        block,
-                        fetchedInfo.timestamp,
-                        fetchedInfo.transactions.length,
-                        fetchedInfo.gasUsed,
-                        fetchedInfo.gasLimit
-                    )
-                );
-            } catch (e: any) {
-                blockFetchErrors.push(e);
-            }
-        }
-
-        blocksBar.stop();
-
-        Logger.success('Gathered block info');
-
-        if (blockFetchErrors.length > 0) {
-            Logger.warn('Errors encountered during block info fetch:');
-
-            for (const err of blockFetchErrors) {
-                Logger.error(err.message);
-            }
-        }
+        Logger.success('Gathering transaction receipts finished');
 
         return blocksMap;
     }
 
-    async calcTPS(stats: txStats[], provider: Provider): Promise<number> {
+    async calcTPS(stats: txStats[], blockInfo: Map<number, BlockInfo>, provider: Provider): Promise<[number, number, number]> {
         Logger.title('\n🧮 Calculating TPS data 🧮\n');
         let totalTxs = 0;
         let totalTime = 0;
+        let maxTxsPerSecond = 0;
+        let minTxsPerSecond = Infinity;
 
         // Find the average txn time per block
         const blockFetchErrors = [];
@@ -351,34 +203,58 @@ class StatCollector {
             try {
                 const currentBlockNum = block;
                 const parentBlockNum = currentBlockNum - 1;
+                let currentBlockTxsNum = 0;
 
                 if (!blockTimeMap.has(parentBlockNum)) {
-                    const parentBlock = await provider.getBlock(parentBlockNum);
-
-                    blockTimeMap.set(parentBlockNum, parentBlock.timestamp);
+                    if (blockInfo.has(parentBlockNum)) {
+                        const parentBlockInfo = blockInfo.get(parentBlockNum) as BlockInfo;
+                        blockTimeMap.set(parentBlockNum, parentBlockInfo.createdAt);
+                    } else {
+                        const parentBlock = await provider.getBlock(parentBlockNum);
+                        blockTimeMap.set(parentBlockNum, parentBlock.timestamp);
+                    }
                 }
 
-                const parentBlock = blockTimeMap.get(parentBlockNum) as number;
+                const parentBlockTimestamp = blockTimeMap.get(parentBlockNum) as number;
 
                 if (!blockTimeMap.has(currentBlockNum)) {
-                    const currentBlock = await provider.getBlock(
-                        currentBlockNum
-                    );
+                    if (blockInfo.has(currentBlockNum)) {
+                        const currentBlockInfo = blockInfo.get(currentBlockNum) as BlockInfo;
+                        blockTimeMap.set(currentBlockNum, currentBlockInfo.createdAt);
+                        currentBlockTxsNum = currentBlockInfo.numTxs;
+                    } else {
+                        const currentBlock = await provider.getBlock(
+                            currentBlockNum
+                        );
 
-                    blockTimeMap.set(currentBlockNum, currentBlock.timestamp);
+                        blockTimeMap.set(currentBlockNum, currentBlock.timestamp);
+                        currentBlockTxsNum = currentBlock.transactions.length;
+                    }
                 }
 
                 const currentBlock = blockTimeMap.get(
                     currentBlockNum
                 ) as number;
 
-                totalTime += Math.round(Math.abs(currentBlock - parentBlock));
+                const blockTime = Math.round(Math.abs(currentBlock - parentBlockTimestamp));
+                const currentBlockTxsPerSecond = currentBlockTxsNum / blockTime;
+
+                if (currentBlockTxsPerSecond > maxTxsPerSecond) {
+                    maxTxsPerSecond = currentBlockTxsPerSecond;
+                }
+
+                if (currentBlockTxsPerSecond < minTxsPerSecond) {
+                    minTxsPerSecond = currentBlockTxsPerSecond;
+                }
+
+                totalTime += blockTime;
+
             } catch (e: any) {
                 blockFetchErrors.push(e);
             }
         }
 
-        return Math.ceil(totalTxs / totalTime);
+        return [Math.ceil(totalTxs / totalTime), minTxsPerSecond, maxTxsPerSecond];
     }
 
     printBlockData(blockInfoMap: Map<number, BlockInfo>) {
@@ -410,7 +286,7 @@ class StatCollector {
         Logger.info(utilizationTable.toString());
     }
 
-    printFinalData(tps: number, blockInfoMap: Map<number, BlockInfo>) {
+    printFinalData(tps: [number, number, number], blockInfoMap: Map<number, BlockInfo>) {
         // Find average utilization
         let totalUtilization = 0;
         blockInfoMap.forEach((info) => {
@@ -419,11 +295,13 @@ class StatCollector {
         const avgUtilization = totalUtilization / blockInfoMap.size;
 
         const finalDataTable = new Table({
-            head: ['TPS', 'Blocks', 'Avg. Utilization'],
+            head: ['Average TPS', 'Min TPS', 'Max TPS', 'Blocks', 'Avg. Utilization'],
         });
 
         finalDataTable.push([
-            tps,
+            tps[0],
+            tps[1],
+            tps[2],
             blockInfoMap.size,
             `${avgUtilization.toFixed(2)}%`,
         ]);
@@ -433,38 +311,95 @@ class StatCollector {
 
     async generateStats(
         txHashes: string[],
-        mnemonic: string,
         url: string,
-        batchSize: number
     ): Promise<CollectorData> {
         if (txHashes.length == 0) {
             Logger.warn('No stat data to display');
 
-            return new CollectorData(0, new Map());
+            return new CollectorData(0, 0, 0, new Map());
         }
+
+        let txStats: txStats[] = [];
 
         Logger.title('\n⏱ Statistics calculation initialized ⏱\n');
 
         const provider = new JsonRpcProvider(url);
 
         // Fetch receipts
-        const txStats = await this.gatherTransactionReceipts(
+        const blockInfoMap = await this.gatherTransactionReceipts(
             txHashes,
-            batchSize,
+            txStats,
             provider
         );
-
-        // Fetch block info
-        const blockInfoMap = await this.fetchBlockInfo(txStats, provider);
 
         // Print the block utilization data
         this.printBlockData(blockInfoMap);
 
         // Print the final TPS and avg. utilization data
-        const avgTPS = await this.calcTPS(txStats, provider);
+        const avgTPS = await this.calcTPS(txStats, blockInfoMap, provider);
         this.printFinalData(avgTPS, blockInfoMap);
 
-        return new CollectorData(avgTPS, blockInfoMap);
+        return new CollectorData(avgTPS[0], avgTPS[1], avgTPS[2], blockInfoMap);
+    }
+
+    async waitForTxPoolToEmpty(url: string, numOfTxs: number): Promise<boolean> {
+        let timeout = numOfTxs * 500; // assume a transaction needs half a second
+        let stopFlag = false;
+
+        if (timeout < 1000) {
+            timeout = 5000 // Set a minimum timeout of 5 seconds
+        } else if (timeout > 200000) { // if the timeout is too large, set it to 200 seconds
+            timeout = 200000;
+        }
+
+        Logger.info('\nWaiting for all transactions to be executed...');
+
+        const txpoolStatusPromise = async () => {
+            while (!stopFlag) {
+                try {
+                    const response = await axios.post(url, {
+                        jsonrpc: '2.0',
+                        method: 'txpool_status',
+                        params: [],
+                        id: 1,
+                    });
+    
+                    const { pending: newPending, queued: newQueued } = response.data.result;
+    
+                    Logger.info(
+                        `Pending: ${newPending} | Queued: ${newQueued}`
+                    );
+
+                    if ((newPending === 0 && newQueued === 0) || (newPending === '0x0' && newQueued === '0x0')){
+                        return true; // Break the loop if there are no pending or queued transactions
+                    }
+    
+                } catch (error) {
+                    console.error('Error checking txpool status:', error);
+                }
+    
+                await new Promise(resolve => setTimeout(resolve, 2 * 1000)); // ping every 2 seconds
+            }
+
+            return true;
+        };
+        
+        const timeoutPromise = new Promise<boolean>((_, reject) => {
+            setTimeout(() => {
+                stopFlag = true; // Stop the txpoolStatusPromise loop
+                reject(new Error('Timeout: Waiting for tx pool to empty took longer than ' + timeout / 1000 + 'seconds.'));
+            }, timeout);
+        });
+
+        try {
+            await Promise.race([txpoolStatusPromise(), timeoutPromise]);
+
+            return true;
+        } catch (error: any) {
+            Logger.warn(error.message);
+
+            return false;
+        }
     }
 }
 
